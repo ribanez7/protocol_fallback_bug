@@ -1,5 +1,8 @@
 # `defimpl for: Any` introduces spurious compile-connected dependencies
 
+**Elixir:** 1.19.5 (compiled with Erlang/OTP 28)
+**Erlang/OTP:** 28.4.1
+
 ## Project structure
 
 ```
@@ -18,22 +21,68 @@ lib/
 ## Reproducing
 
 ```bash
-cd ~/workspace/protocol_fallback_bug
 mix compile
 mix xref graph --label compile-connected --fail-above 0
 ```
 
-Outputs 4 compile-connected edges and fails. Every `defimpl` gets a compile-connected dependency to the protocol, and the `Any` impl and protocol form a compile cycle.
+### Output
 
-## Key finding during investigation
+```
+lib/presentable.ex
+└── lib/presentable/any.ex (compile)
+** (Mix) Too many references (found: 1, permitted: 0)
+```
 
-The trigger is actually the existence of `defimpl for: Any` — not `@fallback_to_any true` itself. I tested all four combinations:
+The protocol definition (`presentable.ex`) has a compile dependency on its
+`Any` implementation (`any.ex`). This is inverted; the protocol should not
+depend on any of its implementations at compile time.
+
+## Expected behavior
+
+Zero compile-connected dependencies. Protocol implementations should only have
+a runtime or exports dependency on the protocol definition, never the reverse.
+
+## Why this matters
+
+The compile dependency from the protocol to `any.ex` means:
+
+1. Any change to `any.ex` forces `presentable.ex` to recompile.
+2. Since all implementations depend on the protocol (via exports), they
+   transitively recompile too.
+3. In a real project with 23+ implementations, a single change to the `Any`
+   fallback cascades into recompilation of every implementation file.
+
+This defeats the purpose of protocols as a compile-time decoupling mechanism.
+
+## Key finding
+
+The trigger is the existence of `defimpl for: Any`, not `@fallback_to_any true`
+itself. Tested all four combinations:
 
 | `@fallback_to_any true` | `defimpl for: Any` | Compile-connected deps |
 |---|---|---|
 | No | No | 0 |
 | Yes | No | 0 |
-| No | Yes | 4 |
-| Yes | Yes | 4 |
+| No | Yes | 1 |
+| Yes | Yes | 1 |
 
-So the issue is that when a protocol has an implementation for `Any`, the protocol module gains a compile dependency on `any.ex`, and then every other implementation that has a compile dependency on the protocol becomes compile-connected transitively. This means changing any implementation (or the protocol itself) cascades into recompilation of all other implementations. In a real project with 23+ implementations, this completely defeats protocol-based decoupling.
+## Note on Elixir 1.18.x
+
+On Elixir 1.18.3 (Erlang/OTP 27.3), the scope of this problem was larger.
+Every `defimpl` file gained a compile-connected dependency to the protocol
+(4 edges in this reproduction, not just 1), and all implementations formed a
+compile cycle with the protocol through the `Any` implementation:
+
+```
+lib/presentable/any.ex
+└── lib/presentable.ex (compile)
+    └── lib/presentable/any.ex (compile)
+lib/presentable/cat.ex
+└── lib/presentable.ex (compile)
+lib/presentable/dog.ex
+└── lib/presentable.ex (compile)
+```
+
+It appears that 1.19.x partially fixed this; the implementations no longer
+have direct compile deps to the protocol, but the inverted compile dependency
+from the protocol to `any.ex` remains.
